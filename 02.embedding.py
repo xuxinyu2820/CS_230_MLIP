@@ -50,3 +50,15 @@ def build_descriptor(
     S_cut = S_i[:M_prime, :]           # (M', 4)
     D_i = S_i @ S_cut.T                # (emb_dim, M')
     return D_i
+
+def build_descriptor_flat(
+    S_i: jnp.ndarray,       # (emb_dim, 4)
+    M_prime: int,
+) -> jnp.ndarray:
+    """
+        D_flat  : (emb_dim * M_prime,)
+    """
+    S_cut = S_i[:M_prime, :]           # (M', 4)
+    D_i = S_i @ S_cut.T                # (emb_dim, M')
+    D_flat = D_i.reshape(-1,)          # (emb_dim*M_prime,)
+    return D_flat
