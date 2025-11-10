@@ -149,32 +149,27 @@ class EmbeddingNet(nnx.Module):
     """
     def __init__(self, hidden: Sequence[int], M: int, *, rngs: nnx.Rngs):
         layers = []
-        ln_gammas = []
-        ln_betas = []
+        norms = []
         in_dim = 1
         for h in hidden:
-            layers.append(nnx.Linear(in_dim, h, rngs=rngs,
-                                     kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64))
-            ln_gammas.append(nnx.Param(jnp.ones((h,), dtype=jnp.float64)))
-            ln_betas.append(nnx.Param(jnp.zeros((h,), dtype=jnp.float64)))
+            layers.append(
+                nnx.Linear(in_dim, h, rngs=rngs,
+                           kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
+            )
+            norms.append(
+                nnx.LayerNorm(reduction_axes=-1, param_dtype=jnp.float64)
+            )
             in_dim = h
-        self.layers = layers
-        self.ln_gammas = ln_gammas
-        self.ln_betas = ln_betas
+        self.layers = nnx.List(layers)
+        self.norms = nnx.List(norms)
         self.out = nnx.Linear(in_dim, M, rngs=rngs,
                               kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
 
-    def _layer_norm(self, x, gamma, beta, eps=1e-5):
-        mu = jnp.mean(x, axis=-1, keepdims=True)
-        var = jnp.mean((x - mu) ** 2, axis=-1, keepdims=True)
-        xhat = (x - mu) / jnp.sqrt(var + eps)
-        return xhat * gamma + beta
-
     def __call__(self, shat: jnp.ndarray) -> jnp.ndarray:
         shat = shat[..., None]
-        for lyr, g, b in zip(self.layers, self.ln_gammas, self.ln_betas):
+        for lyr, ln in zip(self.layers, self.norms):
             shat = lyr(shat)
-            shat = self._layer_norm(shat, g, b)
+            shat = ln(shat)
             shat = jax.nn.relu(shat)
         return self.out(shat)
 
@@ -190,7 +185,7 @@ class DescriptorNet(nnx.Module):
         self.Mp = Mp
         self.env = EnvironmentMatrix(self.r_cs, self.r_c, self.s_mean, self.s_std, self.corrds_std)
         self.embed = EmbeddingNet(self.hidden, self.M, rngs=rngs)
-        self.Zmax = 5
+        self.Zmax = 128
         self.pair_w = nnx.Param(jnp.ones((self.Zmax + 1, self.Zmax + 1), dtype=jnp.float64))
 
     def __call__(self, edge_vecs: jnp.ndarray, Zi: jnp.ndarray, Zj: jnp.ndarray) -> jnp.ndarray:
@@ -212,31 +207,26 @@ class FittingNet(nnx.Module):
         self.hidden = hidden
         in_dim = M * Mp
         layers = []
-        ln_gammas = []
-        ln_betas = []
+        norms = []
         for h in hidden:
-            layers.append(nnx.Linear(in_dim, h, rngs=rngs,
-                                     kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64))
-            ln_gammas.append(nnx.Param(jnp.ones((h,), dtype=jnp.float64)))
-            ln_betas.append(nnx.Param(jnp.zeros((h,), dtype=jnp.float64)))
+            layers.append(
+                nnx.Linear(in_dim, h, rngs=rngs,
+                           kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
+            )
+            norms.append(
+                nnx.LayerNorm(reduction_axes=-1, param_dtype=jnp.float64)
+            )
             in_dim = h
-        self.layers = layers
-        self.ln_gammas = ln_gammas
-        self.ln_betas = ln_betas
+        self.layers = nnx.List(layers)
+        self.norms = nnx.List(norms)
         self.out = nnx.Linear(in_dim, 1, rngs=rngs,
                               kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
 
-    def _layer_norm(self, x, gamma, beta, eps=1e-5):
-        mu = jnp.mean(x, axis=-1, keepdims=True)
-        var = jnp.mean((x - mu) ** 2, axis=-1, keepdims=True)
-        xhat = (x - mu) / jnp.sqrt(var + eps)
-        return xhat * gamma + beta
-
     def __call__(self, Di: jnp.ndarray) -> jnp.ndarray:
         Di = Di.reshape(-1)
-        for lyr, g, b in zip(self.layers, self.ln_gammas, self.ln_betas):
+        for lyr, ln in zip(self.layers, self.norms):
             Di = lyr(Di)
-            Di = self._layer_norm(Di, g, b)
+            Di = ln(Di)
             Di = jax.nn.relu(Di)
         return self.out(Di)
 
