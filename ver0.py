@@ -157,11 +157,13 @@ class EmbeddingNet(nnx.Module):
                            kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
             )
             norms.append(
-                nnx.LayerNorm(reduction_axes=-1, param_dtype=jnp.float64)
+                nnx.LayerNorm(num_features=h, reduction_axes=-1, param_dtype=jnp.float64, rngs=rngs)
             )
             in_dim = h
-        self.layers = nnx.List(layers)
-        self.norms = nnx.List(norms)
+        #self.layers = nnx.List(layers)
+        #self.norms = nnx.List(norms)
+        self.layers = layers
+        self.norms = norms
         self.out = nnx.Linear(in_dim, M, rngs=rngs,
                               kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
 
@@ -172,7 +174,6 @@ class EmbeddingNet(nnx.Module):
             shat = ln(shat)
             shat = jax.nn.relu(shat)
         return self.out(shat)
-
 class DescriptorNet(nnx.Module):
     """
     Compute descriptor matrix D^i for a single atom.
@@ -214,11 +215,13 @@ class FittingNet(nnx.Module):
                            kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
             )
             norms.append(
-                nnx.LayerNorm(reduction_axes=-1, param_dtype=jnp.float64)
+                nnx.LayerNorm(num_features=h, reduction_axes=-1, param_dtype=jnp.float64, rngs=rngs)
             )
             in_dim = h
-        self.layers = nnx.List(layers)
-        self.norms = nnx.List(norms)
+        #self.layers = nnx.List(layers)
+        #self.norms = nnx.List(norms)
+        self.layers = layers
+        self.norms = norms
         self.out = nnx.Linear(in_dim, 1, rngs=rngs,
                               kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
 
@@ -249,6 +252,7 @@ class EnergyNet(nnx.Module):
             return self.fit(self.desc(ev, Zi_scalar, Zj))
         return jax.vmap(_one_with_Zi, in_axes=(0,0,0), out_axes=0)(edge_vecs_batch, neigh_idx_batch, Zi_batch)
 
+################ Network Hyperparameter ################
 r_cs = 2.0
 r_c = 6.0
 hidden_embed = [24, 48]
@@ -263,6 +267,7 @@ fit  = FittingNet(hidden_fit, M, Mp, rngs=rngs)
 net  = EnergyNet(desc, fit)
 E = net(edge_vecs, edge_index, atomic_numbers.astype(jnp.int32))
 
+################ Training Setup ################
 r0 = 2e-3
 decay_rate = 0.98
 decay_step = 1500
