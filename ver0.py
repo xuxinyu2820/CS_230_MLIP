@@ -227,6 +227,7 @@ def train_step(model, optimizer, edge_vecs, neigh_idx, atom2struct, E_true_struc
         loss_e = pe * jnp.mean((eps_pred - eps_true) ** 2)
         loss_f = pf / (3.0 * edge_vecs.shape[0]) * jnp.sum((F_pred - F_true) ** 2)
         jax.debug.print("F_pred[0]={}, F_true[0]={}", F_pred[0], F_true[0])
+        jax.debug.print("Etot_pred[0]={}, Etot_true[0]={}", Etot_pred[0], E_true_struct[0])
         return loss_e + loss_f
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
