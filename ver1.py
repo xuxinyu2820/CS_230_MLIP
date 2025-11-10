@@ -20,6 +20,10 @@ from deepx.data.from_dft import AbInitDataSetFeature
 from deepx.data.graphset import GraphSetInMemory, GraphSetOnDisk
 from deepx.data.dataloader import get_loader_training
 
+import csv
+from pathlib import Path
+from datetime import datetime
+
 torch.set_default_dtype(torch.float32)
 
 dft_data_feature = AbInitDataSetFeature("./ethanol-transfer/dft")
@@ -183,13 +187,13 @@ class DescriptorNet(nnx.Module):
     """
     def __init__(self, 
                  r_cs, r_c, s_mean, s_std, corrds_std,
-                 hidden: Sequence[int], M: int, Mp: int, rngs: nnx.Rngs,
-                 Zmax: int):
+                 hidden: Sequence[int], M: int, Mp: int, rngs: nnx.Rngs):
         self.r_cs, self.r_c, self.s_mean, self.s_std, self.corrds_std = r_cs, r_c, s_mean, s_std, corrds_std
-        self.hidden, self.M, self.Mp = hidden, M, Mp
+        self.hidden, self.M = hidden, M
+        self.Mp = Mp
         self.env = EnvironmentMatrix(self.r_cs, self.r_c, self.s_mean, self.s_std, self.corrds_std)
         self.embed = EmbeddingNet(self.hidden, self.M, rngs=rngs)
-        self.Zmax = int(Zmax)
+        self.Zmax = 5
         self.pair_w = nnx.Param(jnp.ones((self.Zmax + 1, self.Zmax + 1), dtype=jnp.float64))
 
     def __call__(self, edge_vecs: jnp.ndarray, Zi: jnp.ndarray, Zj: jnp.ndarray) -> jnp.ndarray:
@@ -209,7 +213,7 @@ class FittingNet(nnx.Module):
     def __init__(self, hidden: Sequence[int], M: int, Mp: int, *, rngs: nnx.Rngs):
         self.M, self.Mp = M, Mp
         in_dim = M * Mp
-        self.layers    = nnx.List()
+        self.layers    = nnx.List()   # <- 用 nnx.List
         self.ln_gammas = nnx.List()
         self.ln_betas  = nnx.List()
         for h in hidden:
@@ -352,6 +356,18 @@ Ncut = 21
 pe_start, pe_limit = 1.0, 1.0
 pf_start, pf_limit = 10.0, 1.0
 
+runs_dir = Path("./runs")
+runs_dir.mkdir(parents=True, exist_ok=True)
+log_path = runs_dir / f"train_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+with open(log_path, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "epoch", "lr", "pe", "pf",
+        "train_loss", "train_eRMSE", "train_fRMSE",
+        "val_loss", "val_eRMSE", "val_fRMSE",
+    ])
+
 global_step = 0
 for epoch in range(1, num_epochs + 1):
     net.train()
@@ -390,6 +406,15 @@ for epoch in range(1, num_epochs + 1):
     val_loss = val_loss_sum / max(1, val_batches)
     val_e_rmse = val_e_rmse_sum / max(1, val_batches)
     val_f_rmse = val_f_rmse_sum / max(1, val_batches)
+    rt_epoch = float(lr_schedule(global_step - 1))
+    with open(log_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            int(epoch),
+            rt_epoch, float(pe_cur), float(pf_cur),
+            float(train_loss), float(train_e_rmse), float(train_f_rmse),
+            float(val_loss),   float(val_e_rmse),   float(val_f_rmse),
+        ])
 
     if epoch % 10 == 0 or epoch == 1:
         print(f"epoch {epoch:04d} | lr={float(rt):.3e} | pe={float(pe_cur):.2f} pf={float(pf_cur):.2f} | "
@@ -408,4 +433,12 @@ for b in test_loader:
 test_loss = test_loss_sum / max(1, test_batches)
 test_e_rmse = test_e_rmse_sum / max(1, test_batches)
 test_f_rmse = test_f_rmse_sum / max(1, test_batches)
+test_path = runs_dir / "test_metrics.csv"
+with open(test_path, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["loss", "eRMSE", "fRMSE"])
+    writer.writerow([float(test_loss), float(test_e_rmse), float(test_f_rmse)])
+
+print(f"[LOG] per-epoch CSV: {log_path}")
+print(f"[LOG] test metrics CSV: {test_path}")
 print(f"[TEST] loss = {test_loss:.6f} | eRMSE {test_e_rmse:.6e} | fRMSE {test_f_rmse:.6e}")
