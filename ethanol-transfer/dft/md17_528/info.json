@@ -1,0 +1,15 @@
+{
+  "atoms_quantity": 9,
+  "spinful": false,
+  "elements_orbital_map": {
+    "C": [],
+    "O": [],
+    "H": []
+  },
+  "elements_force_rcut_map": {
+    "C": 5.0,
+    "O": 5.0,
+    "H": 5.0
+  },
+  "max_num_neighbors": 500
+}

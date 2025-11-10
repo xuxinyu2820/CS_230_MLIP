@@ -5,7 +5,7 @@ def emb_apply_row(x: jnp.ndarray, params) -> jnp.ndarray:
     """MLP: (4,) -> (emb_dim,)"""
     h = x
     for W, b in params[:-1]:
-        h = jnp.tanh(W @ h + b)
+        h = jnp.relu(W @ h + b)
     W_last, b_last = params[-1]
     y = W_last @ h + b_last
     return y
