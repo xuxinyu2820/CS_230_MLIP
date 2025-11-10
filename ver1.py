@@ -183,13 +183,13 @@ class DescriptorNet(nnx.Module):
     """
     def __init__(self, 
                  r_cs, r_c, s_mean, s_std, corrds_std,
-                 hidden: Sequence[int], M: int, Mp: int, rngs: nnx.Rngs):
+                 hidden: Sequence[int], M: int, Mp: int, rngs: nnx.Rngs,
+                 Zmax: int):
         self.r_cs, self.r_c, self.s_mean, self.s_std, self.corrds_std = r_cs, r_c, s_mean, s_std, corrds_std
-        self.hidden, self.M = hidden, M
-        self.Mp = Mp
+        self.hidden, self.M, self.Mp = hidden, M, Mp
         self.env = EnvironmentMatrix(self.r_cs, self.r_c, self.s_mean, self.s_std, self.corrds_std)
         self.embed = EmbeddingNet(self.hidden, self.M, rngs=rngs)
-        self.Zmax = 5
+        self.Zmax = int(Zmax)
         self.pair_w = nnx.Param(jnp.ones((self.Zmax + 1, self.Zmax + 1), dtype=jnp.float64))
 
     def __call__(self, edge_vecs: jnp.ndarray, Zi: jnp.ndarray, Zj: jnp.ndarray) -> jnp.ndarray:
@@ -208,20 +208,18 @@ class FittingNet(nnx.Module):
     """
     def __init__(self, hidden: Sequence[int], M: int, Mp: int, *, rngs: nnx.Rngs):
         self.M, self.Mp = M, Mp
-        self.hidden = hidden
         in_dim = M * Mp
-        layers = []
-        ln_gammas = []
-        ln_betas = []
+        self.layers    = nnx.List()
+        self.ln_gammas = nnx.List()
+        self.ln_betas  = nnx.List()
         for h in hidden:
-            layers.append(nnx.Linear(in_dim, h, rngs=rngs,
-                                     kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64))
-            ln_gammas.append(nnx.Param(jnp.ones((h,), dtype=jnp.float64)))
-            ln_betas.append(nnx.Param(jnp.zeros((h,), dtype=jnp.float64)))
+            self.layers.append(
+                nnx.Linear(in_dim, h, rngs=rngs,
+                           kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
+            )
+            self.ln_gammas.append(nnx.Param(jnp.ones((h,),  dtype=jnp.float64)))
+            self.ln_betas.append (nnx.Param(jnp.zeros((h,), dtype=jnp.float64)))
             in_dim = h
-        self.layers = layers
-        self.ln_gammas = ln_gammas
-        self.ln_betas = ln_betas
         self.out = nnx.Linear(in_dim, 1, rngs=rngs,
                               kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
 
