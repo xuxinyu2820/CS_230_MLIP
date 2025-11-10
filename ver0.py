@@ -80,9 +80,9 @@ def prepare_batch(batch, Ncut=10):
     E_true_struct = jnp.asarray(batch.energy, dtype=jnp.float64) # (S,)
     F_true        = jnp.asarray(batch.label,  dtype=jnp.float64) # (N,3)
     atom2struct   = jnp.asarray(batch.batch)                     # (N,)
-    return neigh_idx, edge_vecs, atom2struct, E_true_struct, F_true
+    return neigh_idx, edge_vecs, atom2struct, E_true_struct, F_true, Z
 
-edge_index, edge_vecs = topM_edges(edge_index, edge_attr, Ncut=10) # (N, Ncut), (N, Ncut, 3). These are the inputs to the model.
+edge_index, edge_vecs = topM_edges(edge_index, edge_attr, Ncut=10) # (N, Ncut), (N, Ncut, 3)
 
 def _smooth_cutoff_one(r, r_cs, r_c, eps=1e-8):
     r_safe = jnp.maximum(r, eps)
@@ -96,21 +96,17 @@ def compute_env_stats(train_loader, r_cs, r_c, eps=1e-6):
     sum_s = 0.0; sumsq_s = 0.0; cnt_s = 0
     sum_xyz = 0.0; sumsq_xyz = 0.0; cnt_xyz = 0
     for b in train_loader:
-        vec = jnp.array(b.edge_attr[:, 1:], dtype=jnp.float64)     # (E,3): dx,dy,dz
-        r = jnp.linalg.norm(vec, axis=1)                           # (E,)
-        valid = (r > eps) & (r < r_c)                              # (E,) 
+        vec = jnp.array(b.edge_attr[:, 1:], dtype=jnp.float64)     # (E,3)
+        r = jnp.linalg.norm(vec, axis=1)
+        valid = (r > eps) & (r < r_c)
         if not bool(valid.any()):
             continue
         r = r[valid]; vec = vec[valid]
-
-        s = _smooth_cutoff_one(r, r_cs, r_c)                       # s(r_ij)
-        # 式(2)：s(r) 的均值与标准差
+        s = _smooth_cutoff_one(r, r_cs, r_c)
         sum_s += float(s.sum())
         sumsq_s += float(jnp.sum(s * s))
         cnt_s += int(s.size)
-
-        # 式(3)：把 {s x, s y, s z} 合成一个大样本求整体标准差
-        svec = (s[:, None] * vec).reshape(-1)                      # (3*E_valid,)
+        svec = (s[:, None] * vec).reshape(-1)
         sum_xyz += float(svec.sum())
         sumsq_xyz += float(jnp.dot(svec, svec))
         cnt_xyz += int(svec.size)
@@ -118,7 +114,6 @@ def compute_env_stats(train_loader, r_cs, r_c, eps=1e-6):
     s_mean = sum_s / max(1, cnt_s)
     var_s = max(sumsq_s / max(1, cnt_s) - s_mean * s_mean, 1e-12)
     s_std = var_s ** 0.5
-
     mu_xyz = sum_xyz / max(1, cnt_xyz)
     var_xyz = max(sumsq_xyz / max(1, cnt_xyz) - mu_xyz * mu_xyz, 1e-12)
     corrds_std = var_xyz ** 0.5
@@ -139,12 +134,11 @@ class EnvironmentMatrix(nnx.Module):
         self.corrds_std = corrds_std    
     
     def __call__(self, edge_vecs):
-        lengths = jnp.linalg.norm(edge_vecs, axis=1)  # (Ncut, )
+        lengths = jnp.linalg.norm(edge_vecs, axis=1)
         sij = _smooth_cutoff_one(lengths, self.r_cs, self.r_c)
         r0 = (sij - self.s_mean) / self.s_std
         rvec = edge_vecs * sij[:,None] / self.corrds_std
-
-        return jnp.concatenate([r0[:,None], rvec], axis=-1) # (Ncut, 4)
+        return jnp.concatenate([r0[:,None], rvec], axis=-1)
 
 class EmbeddingNet(nnx.Module):
     """
@@ -155,20 +149,34 @@ class EmbeddingNet(nnx.Module):
     """
     def __init__(self, hidden: Sequence[int], M: int, *, rngs: nnx.Rngs):
         layers = []
+        ln_gammas = []
+        ln_betas = []
         in_dim = 1
         for h in hidden:
             layers.append(nnx.Linear(in_dim, h, rngs=rngs,
                                      kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64))
+            ln_gammas.append(nnx.Param(jnp.ones((h,), dtype=jnp.float64)))
+            ln_betas.append(nnx.Param(jnp.zeros((h,), dtype=jnp.float64)))
             in_dim = h
         self.layers = layers
+        self.ln_gammas = ln_gammas
+        self.ln_betas = ln_betas
         self.out = nnx.Linear(in_dim, M, rngs=rngs,
                               kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
 
+    def _layer_norm(self, x, gamma, beta, eps=1e-5):
+        mu = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.mean((x - mu) ** 2, axis=-1, keepdims=True)
+        xhat = (x - mu) / jnp.sqrt(var + eps)
+        return xhat * gamma + beta
+
     def __call__(self, shat: jnp.ndarray) -> jnp.ndarray:
-        shat = shat[..., None]                    # (Ncut, 1)
-        for lyr in self.layers:
-            shat = jax.nn.relu(lyr(shat))
-        return self.out(shat)                     # (Ncut, M)
+        shat = shat[..., None]
+        for lyr, g, b in zip(self.layers, self.ln_gammas, self.ln_betas):
+            shat = lyr(shat)
+            shat = self._layer_norm(shat, g, b)
+            shat = jax.nn.relu(shat)
+        return self.out(shat)
 
 class DescriptorNet(nnx.Module):
     """
@@ -182,14 +190,17 @@ class DescriptorNet(nnx.Module):
         self.Mp = Mp
         self.env = EnvironmentMatrix(self.r_cs, self.r_c, self.s_mean, self.s_std, self.corrds_std)
         self.embed = EmbeddingNet(self.hidden, self.M, rngs=rngs)
+        self.Zmax = 5
+        self.pair_w = nnx.Param(jnp.ones((self.Zmax + 1, self.Zmax + 1), dtype=jnp.float64))
 
-    def __call__(self, edge_vecs: jnp.ndarray) -> jnp.ndarray:
-        env = self.env(edge_vecs) # (Ncut, 4)
-        Gi = self.embed(env[:, 0]) # (Ncut, M)
-        Si = Gi.T @ env # (M, 4)
-        Si_small = Si[:self.Mp] # (Mp, 4)
-        Di = Si @ Si_small.T # (M, Mp)
-
+    def __call__(self, edge_vecs: jnp.ndarray, Zi: jnp.ndarray, Zj: jnp.ndarray) -> jnp.ndarray:
+        env = self.env(edge_vecs)
+        w = self.pair_w[Zi, Zj]
+        env = env * w[:, None]
+        Gi = self.embed(env[:, 0])
+        Si = Gi.T @ env
+        Si_small = Si[:self.Mp]
+        Di = Si @ Si_small.T
         return Di
 
 class FittingNet(nnx.Module):
@@ -201,66 +212,91 @@ class FittingNet(nnx.Module):
         self.hidden = hidden
         in_dim = M * Mp
         layers = []
+        ln_gammas = []
+        ln_betas = []
         for h in hidden:
             layers.append(nnx.Linear(in_dim, h, rngs=rngs,
                                      kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64))
+            ln_gammas.append(nnx.Param(jnp.ones((h,), dtype=jnp.float64)))
+            ln_betas.append(nnx.Param(jnp.zeros((h,), dtype=jnp.float64)))
             in_dim = h
         self.layers = layers
+        self.ln_gammas = ln_gammas
+        self.ln_betas = ln_betas
         self.out = nnx.Linear(in_dim, 1, rngs=rngs,
                               kernel_init=HE_INIT, bias_init=zeros_init, param_dtype=jnp.float64)
 
+    def _layer_norm(self, x, gamma, beta, eps=1e-5):
+        mu = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.mean((x - mu) ** 2, axis=-1, keepdims=True)
+        xhat = (x - mu) / jnp.sqrt(var + eps)
+        return xhat * gamma + beta
+
     def __call__(self, Di: jnp.ndarray) -> jnp.ndarray:
-        Di = Di.reshape(-1)                # flatten (M*Mp,)
-        for lyr in self.layers:
-            Di = jax.nn.relu(lyr(Di))
-        return self.out(Di)                # (1,)
+        Di = Di.reshape(-1)
+        for lyr, g, b in zip(self.layers, self.ln_gammas, self.ln_betas):
+            Di = lyr(Di)
+            Di = self._layer_norm(Di, g, b)
+            Di = jax.nn.relu(Di)
+        return self.out(Di)
 
 class EnergyNet(nnx.Module):
     def __init__(self, desc: DescriptorNet, fit: FittingNet):
         self.desc, self.fit = desc, fit
 
-    def _one(self, edge_vecs):                  # edge_vecs: (N_cut, 4)
-        return self.fit(self.desc(edge_vecs))   # (1,)
+    def _one(self, edge_vecs, neigh_idx_row, Z_all):
+        Zi = Z_all[0]
+        Zj = jnp.where(neigh_idx_row >= 0, Z_all[neigh_idx_row], 0).astype(jnp.int32)
+        Zi = jnp.broadcast_to(Zi, ())
+        return self.fit(self.desc(edge_vecs, Zi, Zj))
 
-    def __call__(self, edge_vecs_batch):        # (N, N_cut, 4)
-        return jax.vmap(self._one, in_axes=0, out_axes=0)(edge_vecs_batch)  # (N, 1)
+    def __call__(self, edge_vecs_batch, neigh_idx_batch, Z_all):
+        N = edge_vecs_batch.shape[0]
+        Zi_batch = Z_all[:N]
+        def _one_with_Zi(ev, ni, Zi_scalar):
+            Zj = jnp.where(ni >= 0, Z_all[ni], 0).astype(jnp.int32)
+            Zi_scalar = jnp.asarray(Zi_scalar, dtype=jnp.int32)
+            return self.fit(self.desc(ev, Zi_scalar, Zj))
+        return jax.vmap(_one_with_Zi, in_axes=(0,0,0), out_axes=0)(edge_vecs_batch, neigh_idx_batch, Zi_batch)
 
 r_cs = 2.0
 r_c = 6.0
-hidden_embed = [24, 48, 96]
+hidden_embed = [24, 48]
 hidden_fit   = [96, 96, 96]
 s_mean, s_std, corrds_std = compute_env_stats(train_loader, r_cs, r_c)
 print(f"[stats] s_mean={s_mean:.6f}, s_std={s_std:.6f}, corrds_std={corrds_std:.6f}")
-breakpoint()
 M = 100
-Mp = 10
+Mp = 8
 rngs = nnx.Rngs(0)
 desc = DescriptorNet(r_cs, r_c, s_mean, s_std, corrds_std, hidden_embed, M, Mp, rngs=rngs)
 fit  = FittingNet(hidden_fit, M, Mp, rngs=rngs)
 net  = EnergyNet(desc, fit)
-E = net(edge_vecs)   # edge_vecs.shape == (N, N_cut, 4) -> E.shape == (N, 1)
+E = net(edge_vecs, edge_index, atomic_numbers.astype(jnp.int32))
 
-
-r0 = 1e-3
-decay_rate = 0.95
-decay_step = 40000
+r0 = 2e-3
+decay_rate = 0.98
+decay_step = 1500
 lr_schedule = optax.exponential_decay(
     init_value=r0, transition_steps=decay_step, decay_rate=decay_rate, staircase=True
 )
 optimizer = nnx.Optimizer(net, optax.adam(lr_schedule), wrt=nnx.Param)
 
 @nnx.jit
-def train_step(model, optimizer, edge_vecs, neigh_idx, atom2struct, E_true_struct, F_true, pe, pf):
+def train_step(model, optimizer, edge_vecs, neigh_idx, atom2struct, E_true_struct, F_true, Z_all, pe, pf):
     def loss_fn(model):
-        Ei = jnp.squeeze(model(edge_vecs), -1)                # (N,)
+        Ei = jnp.squeeze(model(edge_vecs, neigh_idx, Z_all), -1)
         S = E_true_struct.shape[0]
         N_per = jnp.zeros(S, dtype=jnp.float64).at[atom2struct].add(1.0)
         Etot_pred = jnp.zeros(S, dtype=jnp.float64).at[atom2struct].add(Ei)
         eps_pred, eps_true = Etot_pred / N_per, E_true_struct / N_per
 
-        # forces
-        def ei_fn(ev): return model.fit(model.desc(ev)).squeeze()
-        dE_dedge = jax.vmap(jax.grad(ei_fn))(edge_vecs)       # (N,Ncut,3)
+        def ei_fn(ev, Zi, Zj):
+            return model.fit(model.desc(ev, Zi, Zj)).squeeze()
+
+        Zi_batch = Z_all[:edge_vecs.shape[0]].astype(jnp.int32)
+        Zj_batch = jnp.where(neigh_idx >= 0, Z_all[neigh_idx], 0).astype(jnp.int32)
+        dE_dedge = jax.vmap(jax.grad(ei_fn), in_axes=(0,0,0))(edge_vecs, Zi_batch, Zj_batch)
+
         own = dE_dedge.sum(axis=1)
         mask = (neigh_idx >= 0)[..., None]
         idx  = jnp.clip(neigh_idx, 0, edge_vecs.shape[0]-1).reshape(-1)
@@ -268,28 +304,35 @@ def train_step(model, optimizer, edge_vecs, neigh_idx, atom2struct, E_true_struc
         others = jnp.zeros_like(own).at[idx].add(contrib)
         F_pred = own + others
 
-        loss_e = pe * jnp.mean((eps_pred - eps_true) ** 2)
-        loss_f = pf / (3.0 * edge_vecs.shape[0]) * jnp.sum((F_pred - F_true) ** 2)
-        jax.debug.print("F_pred[0]={}, F_true[0]={}", F_pred[0], F_true[0])
-        jax.debug.print("Etot_pred[0]={}, Etot_true[0]={}", Etot_pred[0], E_true_struct[0])
-        return loss_e + loss_f
+        mse_e = jnp.mean((eps_pred - eps_true) ** 2)
+        mse_f = jnp.mean((F_pred - F_true) ** 2)
+        loss_e = pe * mse_e
+        loss_f = pf * mse_f
+        rmse_e = jnp.sqrt(mse_e)
+        rmse_f = jnp.sqrt(mse_f)
+        return loss_e + loss_f, (rmse_e, rmse_f)
 
-    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
     optimizer.update(model, grads)
-    return loss
+    rmse_e, rmse_f = aux
+    return loss, rmse_e, rmse_f
 
 @nnx.jit
-def eval_step(model, edge_vecs, neigh_idx, atom2struct, E_true_struct, F_true, pe, pf):
+def eval_step(model, edge_vecs, neigh_idx, atom2struct, E_true_struct, F_true, Z_all, pe, pf):
     def loss_fn(model):
-        Ei = jnp.squeeze(model(edge_vecs), -1)                # (N,)
+        Ei = jnp.squeeze(model(edge_vecs, neigh_idx, Z_all), -1)
         S = E_true_struct.shape[0]
         N_per = jnp.zeros(S).at[atom2struct].add(1.0)
         Etot_pred = jnp.zeros(S).at[atom2struct].add(Ei)
         eps_pred, eps_true = Etot_pred / N_per, E_true_struct / N_per
 
-        # forces
-        def ei_fn(ev): return model.fit(model.desc(ev)).squeeze()
-        dE_dedge = jax.vmap(jax.grad(ei_fn))(edge_vecs)       # (N,Ncut,3)
+        def ei_fn(ev, Zi, Zj):
+            return model.fit(model.desc(ev, Zi, Zj)).squeeze()
+
+        Zi_batch = Z_all[:edge_vecs.shape[0]].astype(jnp.int32)
+        Zj_batch = jnp.where(neigh_idx >= 0, Z_all[neigh_idx], 0).astype(jnp.int32)
+        dE_dedge = jax.vmap(jax.grad(ei_fn), in_axes=(0,0,0))(edge_vecs, Zi_batch, Zj_batch)
+
         own = dE_dedge.sum(axis=1)
         mask = (neigh_idx >= 0)[..., None]
         idx  = jnp.clip(neigh_idx, 0, edge_vecs.shape[0]-1).reshape(-1)
@@ -297,55 +340,75 @@ def eval_step(model, edge_vecs, neigh_idx, atom2struct, E_true_struct, F_true, p
         others = jnp.zeros_like(own).at[idx].add(contrib)
         F_pred = own + others
 
-        loss_e = pe * jnp.mean((eps_pred - eps_true) ** 2)
-        loss_f = pf / (3.0 * edge_vecs.shape[0]) * jnp.sum((F_pred - F_true) ** 2)
-        return loss_e + loss_f
-    return loss_fn(model)
+        mse_e = jnp.mean((eps_pred - eps_true) ** 2)
+        mse_f = jnp.mean((F_pred - F_true) ** 2)
+        loss = pe * mse_e + pf * mse_f
+        rmse_e = jnp.sqrt(mse_e)
+        rmse_f = jnp.sqrt(mse_f)
+        return loss, (rmse_e, rmse_f)
+    loss, aux = loss_fn(model)
+    rmse_e, rmse_f = aux
+    return loss, rmse_e, rmse_f
 
 num_epochs = 2000
 Ncut = 21
-pe_start, pe_limit = 1.0, 400.0
-pf_start, pf_limit = 1000.0, 1.0
+pe_start, pe_limit = 1.0, 1.0
+pf_start, pf_limit = 10.0, 1.0
 
 global_step = 0
 for epoch in range(1, num_epochs + 1):
     net.train()
     train_loss_sum, train_batches = 0.0, 0
+    train_e_rmse_sum, train_f_rmse_sum = 0.0, 0.0
     for b in train_loader:
-        neigh_idx_b, edge_vecs_b, atom2struct_b, E_true_b, F_true_b = prepare_batch(b, Ncut)
+        neigh_idx_b, edge_vecs_b, atom2struct_b, E_true_b, F_true_b, Z_b = prepare_batch(b, Ncut)
 
         rt = lr_schedule(global_step)
         alpha = rt / r0
         pe_cur = pe_limit * (1 - alpha) + pe_start * alpha
         pf_cur = pf_limit * (1 - alpha) + pf_start * alpha
 
-        loss = train_step(net, optimizer, edge_vecs_b, neigh_idx_b,
-                          atom2struct_b, E_true_b, F_true_b,
-                          float(pe_cur), float(pf_cur))
+        loss, e_rmse, f_rmse = train_step(net, optimizer, edge_vecs_b, neigh_idx_b,
+                                          atom2struct_b, E_true_b, F_true_b, Z_b,
+                                          float(pe_cur), float(pf_cur))
         train_loss_sum += float(loss); train_batches += 1
+        train_e_rmse_sum += float(e_rmse)
+        train_f_rmse_sum += float(f_rmse)
         global_step += 1
 
     train_loss = train_loss_sum / max(1, train_batches)
+    train_e_rmse = train_e_rmse_sum / max(1, train_batches)
+    train_f_rmse = train_f_rmse_sum / max(1, train_batches)
 
     net.eval()
     val_loss_sum, val_batches = 0.0, 0
+    val_e_rmse_sum, val_f_rmse_sum = 0.0, 0.0
     for b in val_loader:
-        neigh_idx_b, edge_vecs_b, atom2struct_b, E_true_b, F_true_b = prepare_batch(b, Ncut)
-        vloss = eval_step(net, edge_vecs_b, neigh_idx_b, atom2struct_b, E_true_b, F_true_b,
-                          float(pe_cur), float(pf_cur))
+        neigh_idx_b, edge_vecs_b, atom2struct_b, E_true_b, F_true_b, Z_b = prepare_batch(b, Ncut)
+        vloss, v_e_rmse, v_f_rmse = eval_step(net, edge_vecs_b, neigh_idx_b, atom2struct_b, E_true_b, F_true_b, Z_b,
+                                              float(pe_cur), float(pf_cur))
         val_loss_sum += float(vloss); val_batches += 1
+        val_e_rmse_sum += float(v_e_rmse)
+        val_f_rmse_sum += float(v_f_rmse)
     val_loss = val_loss_sum / max(1, val_batches)
+    val_e_rmse = val_e_rmse_sum / max(1, val_batches)
+    val_f_rmse = val_f_rmse_sum / max(1, val_batches)
 
     if epoch % 10 == 0 or epoch == 1:
         print(f"epoch {epoch:04d} | lr={float(rt):.3e} | pe={float(pe_cur):.2f} pf={float(pf_cur):.2f} | "
-              f"train {train_loss:.6f} | val {val_loss:.6f}")
+              f"train {train_loss:.6f} [eRMSE {train_e_rmse:.6e}, fRMSE {train_f_rmse:.6e}] | "
+              f"val {val_loss:.6f} [eRMSE {val_e_rmse:.6e}, fRMSE {val_f_rmse:.6e}]")
 
-########### Test ###########
 net.eval()
 test_loss_sum, test_batches = 0.0, 0
+test_e_rmse_sum, test_f_rmse_sum = 0.0, 0.0
 for b in test_loader:
-    neigh_idx_b, edge_vecs_b, atom2struct_b, E_true_b, F_true_b = prepare_batch(b, Ncut)
-    tloss = eval_step(net, edge_vecs_b, neigh_idx_b, atom2struct_b, E_true_b, F_true_b, pe, pf)
+    neigh_idx_b, edge_vecs_b, atom2struct_b, E_true_b, F_true_b, Z_b = prepare_batch(b, Ncut)
+    tloss, te_rmse, tf_rmse = eval_step(net, edge_vecs_b, neigh_idx_b, atom2struct_b, E_true_b, F_true_b, Z_b, pe_start, pf_start)
     test_loss_sum += float(tloss); test_batches += 1
+    test_e_rmse_sum += float(te_rmse)
+    test_f_rmse_sum += float(tf_rmse)
 test_loss = test_loss_sum / max(1, test_batches)
-print(f"[TEST] loss = {test_loss:.6f}")
+test_e_rmse = test_e_rmse_sum / max(1, test_batches)
+test_f_rmse = test_f_rmse_sum / max(1, test_batches)
+print(f"[TEST] loss = {test_loss:.6f} | eRMSE {test_e_rmse:.6e} | fRMSE {test_f_rmse:.6e}")
