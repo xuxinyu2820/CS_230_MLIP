@@ -4,7 +4,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # CSV 路径
-csv_path = Path("/global/homes/x/xinyuxu/CS_230_MLIP/runs/train_log_20251110_121639.csv")
+csv_path = Path("/global/homes/x/xinyuxu/CS_230_MLIP/runs/train_log_20251120_102700.csv")
 
 # 读取并提取需要的列（不用 pandas）
 with open(csv_path, "r", newline="") as f:

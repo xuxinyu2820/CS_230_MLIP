@@ -24,7 +24,23 @@ import csv
 from pathlib import Path
 from datetime import datetime
 
+import argparse
+
 torch.set_default_dtype(torch.float32)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--init_lr",       type=float, default=2e-3,  help="Initial learning rate")
+parser.add_argument("--lr_decay_rate", type=float, default=0.98, help="Learning rate decay factor")
+parser.add_argument("--lr_decay_step", type=int,   default=1500, help="Steps between LR decays")
+parser.add_argument("--batch_size",    type=int,   default=4,    help="Batch size")
+parser.add_argument("--num_epochs",    type=int,   default=2000, help="Number of training epochs")
+
+args = parser.parse_args()
+INIT_LR       = args.init_lr
+LR_DECAY_RATE = args.lr_decay_rate
+LR_DECAY_STEP = args.lr_decay_step
+BATCH_SIZE    = args.batch_size
+NUM_EPOCHS    = args.num_epochs
 
 dft_data_feature = AbInitDataSetFeature("./ethanol-transfer/dft")
 graph = GraphSetInMemory(
@@ -40,7 +56,7 @@ print(graph.info)
 print("********************************")
 random_stream = jax.random.PRNGKey(0)
 train_loader, val_loader, test_loader = get_loader_training(
-    graph, train_size=800, val_size=100, test_size=100, batch_size=4, graph_key=random_stream
+    graph, train_size=800, val_size=100, test_size=100, batch_size=BATCH_SIZE, graph_key=random_stream
 )
 batch = next(iter(train_loader))
 
@@ -274,12 +290,16 @@ fit  = FittingNet(hidden_fit, M, Mp, rngs=rngs)
 net  = EnergyNet(desc, fit)
 E = net(edge_vecs, edge_index, atomic_numbers.astype(jnp.int32))
 
-r0 = 2e-3
-decay_rate = 0.98
-decay_step = 1500
+r0 = INIT_LR
+decay_rate = LR_DECAY_RATE
+decay_step = LR_DECAY_STEP
 lr_schedule = optax.exponential_decay(
-    init_value=r0, transition_steps=decay_step, decay_rate=decay_rate, staircase=True
+    init_value=r0,
+    transition_steps=decay_step,
+    decay_rate=decay_rate,
+    staircase=True,
 )
+
 optimizer = nnx.Optimizer(net, optax.adam(lr_schedule), wrt=nnx.Param)
 
 @nnx.jit
@@ -351,12 +371,12 @@ def eval_step(model, edge_vecs, neigh_idx, atom2struct, E_true_struct, F_true, Z
     rmse_e, rmse_f = aux
     return loss, rmse_e, rmse_f
 
-num_epochs = 2000
+num_epochs = NUM_EPOCHS
 Ncut = 21
 pe_start, pe_limit = 1.0, 1.0
 pf_start, pf_limit = 10.0, 1.0
 
-runs_dir = Path("./runs")
+runs_dir = Path("./05.runs")
 runs_dir.mkdir(parents=True, exist_ok=True)
 log_path = runs_dir / f"train_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
