@@ -13,7 +13,7 @@ import flax.nnx as nnx
 from flax.linen.initializers import variance_scaling, zeros as zeros_init
 GLOROT_INIT = variance_scaling(1.0, "fan_avg", "truncated_normal", dtype=jnp.float64)
 HE_INIT = variance_scaling(2.0, "fan_in", "truncated_normal", dtype=jnp.float64)
-
+HE_INIT = GLOROT_INIT
 import optax
 
 from deepx.data.from_dft import AbInitDataSetFeature

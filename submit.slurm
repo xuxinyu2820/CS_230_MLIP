@@ -13,4 +13,4 @@
 module load python
 conda activate cs230mlip-py313
 cd /global/homes/x/xinyuxu/CS_230_MLIP
-python 03.Alyssa_ver1.py --num_epochs 2000 --batch_size 4 --init_lr 0.001 --lr_decay_rate 0.98 --lr_decay_step 1500
+python 03.Alyssa_ver1.py --num_epochs 2000 --batch_size 8 --init_lr 0.002 --lr_decay_rate 0.98 --lr_decay_step 1500
